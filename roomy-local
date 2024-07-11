@@ -1,0 +1,136 @@
+If your application will be on an internal network (intranet) and you want it to be accessible via `roomy.local` without specifying a port, you can set up Docker and use Nginx for reverse proxy on your internal network. Here's how you can do it:
+
+### Step 1: Prepare the Fyne WebAssembly Application
+
+First, ensure your Fyne application is compiled to WebAssembly:
+
+1. **Build for WebAssembly:**
+
+   ```bash
+   fyne-cross wasm -app-id com.example.roomreservation -icon your_icon.png .
+   ```
+
+2. **Create a simple web server to serve the files:**
+
+   Create a file `server.go`:
+
+   ```go
+   package main
+
+   import (
+       "net/http"
+       "log"
+   )
+
+   func main() {
+       fs := http.FileServer(http.Dir("web"))
+       http.Handle("/", fs)
+
+       log.Println("Listening on :8080...")
+       err := http.ListenAndServe(":8080", nil)
+       if err != nil {
+           log.Fatal(err)
+       }
+   }
+   ```
+
+3. **Build the Docker image:**
+
+   Create a `Dockerfile`:
+
+   ```Dockerfile
+   # Use an official Go runtime as a parent image
+   FROM golang:1.16-alpine as builder
+
+   # Set the working directory inside the container
+   WORKDIR /app
+
+   # Copy the Go modules manifests
+   COPY go.mod go.sum ./
+
+   # Download the Go module dependencies
+   RUN go mod download
+
+   # Copy the source code
+   COPY . .
+
+   # Build the application
+   RUN go build -o main .
+
+   # Use an official Nginx image as a parent image
+   FROM nginx:alpine
+
+   # Copy the built binary and other necessary files from the builder stage
+   COPY --from=builder /app/web /usr/share/nginx/html
+
+   # Copy the default nginx.conf to the container
+   COPY nginx.conf /etc/nginx/nginx.conf
+
+   # Expose the port Nginx will run on
+   EXPOSE 80
+
+   # Run Nginx
+   CMD ["nginx", "-g", "daemon off;"]
+   ```
+
+4. **Create an `nginx.conf` file:**
+
+   ```nginx
+   server {
+       listen 80;
+       server_name roomy.local;
+
+       location / {
+           root /usr/share/nginx/html;
+           index index.html;
+       }
+
+       location /wasm_exec.js {
+           alias /usr/local/go/misc/wasm/wasm_exec.js;
+       }
+   }
+   ```
+
+### Step 2: Build and Run the Docker Container
+
+1. **Build the Docker image:**
+
+   ```bash
+   docker build -t fyne-web-app .
+   ```
+
+2. **Run the Docker container:**
+
+   ```bash
+   docker run -d --name fyne-web-app -p 80:80 fyne-web-app
+   ```
+
+### Step 3: Modify your Hosts File
+
+Modify your hosts file on all machines that need to access `roomy.local` to point to your Docker container's IP address:
+
+#### On Windows:
+1. Open `C:\Windows\System32\drivers\etc\hosts` in a text editor with administrative privileges.
+2. Add the following line:
+   ```
+   <INTERNAL_IP_ADDRESS> roomy.local
+   ```
+
+#### On macOS/Linux:
+1. Open `/etc/hosts` in a text editor with sudo.
+2. Add the following line:
+   ```
+   <INTERNAL_IP_ADDRESS> roomy.local
+   ```
+
+Replace `<INTERNAL_IP_ADDRESS>` with the IP address of the machine running the Docker container.
+
+### Step 4: Set up DNS (Optional)
+
+For a larger internal network, you may want to set up an internal DNS server to resolve `roomy.local` to the correct IP address. This can be done using a DNS server like `dnsmasq` or configuring your existing DNS infrastructure.
+
+### Step 5: Access the Web App
+
+Now, you should be able to access your Fyne application in the browser by navigating to `http://roomy.local` on any machine within your internal network.
+
+This setup ensures that your Fyne application is accessible via `roomy.local` on your internal network without needing to specify a port.
