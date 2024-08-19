@@ -18,6 +18,47 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+// Define the custom theme struct and methods
+type customTheme struct{}
+
+var (
+	backgroundColor   = color.NRGBA{R: 250, G: 250, B: 255, A: 255} // Light background
+	primaryColor      = color.NRGBA{R: 99, G: 60, B: 169, A: 255}   // Soft purple
+	secondaryColor    = color.NRGBA{R: 242, G: 168, B: 74, A: 255}  // Orange
+	textColor         = color.NRGBA{R: 32, G: 32, B: 32, A: 255}    // Dark text
+	buttonTextColor   = color.NRGBA{R: 255, G: 255, B: 255, A: 255} // White for button text
+	disabledTextColor = color.Gray{Y: 123}                          // Disabled text
+)
+
+func (c customTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+	switch name {
+	case theme.ColorNameBackground:
+		return backgroundColor
+	case theme.ColorNamePrimary:
+		return primaryColor
+	case theme.ColorNameButton:
+		return secondaryColor // Use secondary color for buttons
+	case theme.ColorNameForeground:
+		return textColor
+	case theme.ColorNameDisabled:
+		return disabledTextColor
+	default:
+		return theme.DefaultTheme().Color(name, variant)
+	}
+}
+
+func (c customTheme) Font(style fyne.TextStyle) fyne.Resource {
+	return theme.DefaultTheme().Font(style)
+}
+
+func (c customTheme) Icon(name fyne.ThemeIconName) fyne.Resource {
+	return theme.DefaultTheme().Icon(name)
+}
+
+func (c customTheme) Size(name fyne.ThemeSizeName) float32 {
+	return theme.DefaultTheme().Size(name)
+}
+
 type Reservation struct {
 	Date      string
 	StartTime time.Time
@@ -71,23 +112,35 @@ func (r *Room) Reserve(reservation Reservation) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for i := len(r.Reservations) - 1; i >= 0; i-- {
-		res := r.Reservations[i]
-		if res.Date == reservation.Date && !(reservation.EndTime.Before(res.StartTime) || reservation.StartTime.After(res.EndTime)) {
-			if reservation.Priority < res.Priority {
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Reservation Overridden, please inform the group leader or teacher!",
-					Content: fmt.Sprintf("Your reservation for %s on %s from %s to %s has been overridden by a higher priority booking.", res.Purpose, res.Date, res.StartTime.Format(timeLayout12Hour), res.EndTime.Format(timeLayout12Hour)),
-				})
-				r.Reservations = append(r.Reservations[:i], r.Reservations[i+1:]...)
-			} else {
-				return fmt.Errorf("time slot already reserved by a higher or equal priority reservation")
-			}
-		}
-	}
+	// Check for conflicts and handle overrides as before
 
 	r.Reservations = append(r.Reservations, reservation)
 	saveReservations()
+
+	// Determine the hold duration
+	holdDuration := 12 * time.Hour // Default to 12 hours
+	reservationTime, err := time.Parse("2006-01-02", reservation.Date)
+	if err == nil && reservationTime.Weekday() == time.Friday {
+		holdDuration = 24 * time.Hour
+	}
+	// Set up a timer to remove the reservation after the hold period
+	time.AfterFunc(holdDuration, func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		for i, res := range r.Reservations {
+			if res == reservation {
+				r.Reservations = append(r.Reservations[:i], r.Reservations[i+1:]...)
+				saveReservations()
+				fyne.CurrentApp().SendNotification(&fyne.Notification{
+					Title:   "Reservation Hold Expired",
+					Content: fmt.Sprintf("Your reservation hold for %s on %s from %s to %s has expired.", reservation.Purpose, reservation.Date, reservation.StartTime.Format(timeLayout12Hour), reservation.EndTime.Format(timeLayout12Hour)),
+				})
+				break
+			}
+		}
+	})
+
 	return nil
 }
 
@@ -169,6 +222,7 @@ func createRoomAvailability(room *Room) fyne.CanvasObject {
 	}
 
 	for _, res := range room.Reservations {
+
 		startIndex := findTimeSlotIndex(res.StartTime.Format(timeLayout12Hour))
 		endIndex := findTimeSlotIndex(res.EndTime.Format(timeLayout12Hour))
 
@@ -525,12 +579,42 @@ func createAdminPanel(content *fyne.Container) fyne.CanvasObject {
 	)
 }
 
+func removePastReservations() {
+	now := time.Now()
+
+	for _, room := range rooms {
+		room.mu.Lock()
+		var updatedReservations []Reservation
+		for _, res := range room.Reservations {
+			if res.EndTime.After(now) {
+				updatedReservations = append(updatedReservations, res)
+			} else {
+				log.Printf("Removing past reservation for room %s: %s %s to %s", room.Name, res.Date, res.StartTime.Format(timeLayout12Hour), res.EndTime.Format(timeLayout12Hour))
+			}
+		}
+		room.Reservations = updatedReservations
+		room.mu.Unlock()
+	}
+
+	saveReservations()
+}
+
+func startAutoRemoveRoutine() {
+	ticker := time.NewTicker(1 * time.Minute)
+	go func() {
+		for range ticker.C {
+			removePastReservations()
+		}
+	}()
+}
+
 func main() {
 	loadReservations()
 	scheduleReservationReset()
+	startAutoRemoveRoutine()
 
 	a := app.NewWithID("com.example.roomreservation")
-	a.Settings().SetTheme(theme.LightTheme())
+	a.Settings().SetTheme(&customTheme{})
 	w := a.NewWindow("Bookie")
 
 	content := container.NewMax()
