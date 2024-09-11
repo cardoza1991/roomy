@@ -478,7 +478,7 @@ func createDeleteButton(room *Room, index int, reservationList *fyne.Container) 
 		}
 
 		confirmDialog := dialog.NewCustomConfirm("Confirm Action", "Confirm", "Cancel", passwordEntry, func(confirmed bool) {
-			if confirmed && passwordEntry.Text == "1948" {
+			if confirmed && passwordEntry.Text == "changeme" {
 				room.DeleteReservation(index)
 				if reservationList != nil {
 					reservationList.Objects = createReservationList(room)
@@ -597,7 +597,7 @@ func showAdminTab(content *fyne.Container) {
 		{Text: "Password", Widget: passwordEntry},
 	}, func(confirmed bool) {
 		if confirmed {
-			if passwordEntry.Text == "El0h1m1948" {
+			if passwordEntry.Text == "Changeme" {
 				content.Objects = []fyne.CanvasObject{createAdminPanel(content)}
 				content.Refresh()
 			} else {
