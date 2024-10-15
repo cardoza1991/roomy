@@ -1,127 +1,45 @@
+// main.go
+
 package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"image"
 	"image/color"
+	"io"
 	"log"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	customtheme "roomy/theme" // Ensure this path is correct
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"golang.org/x/crypto/bcrypt"
 )
 
-// Define the custom theme struct and methods
-type customTheme struct{}
-
-var (
-	backgroundColor   = color.NRGBA{R: 250, G: 250, B: 255, A: 255} // Light background
-	primaryColor      = color.NRGBA{R: 99, G: 60, B: 169, A: 255}   // Soft purple
-	secondaryColor    = color.NRGBA{R: 242, G: 168, B: 74, A: 255}  // Orange
-	textColor         = color.NRGBA{R: 32, G: 32, B: 32, A: 255}    // Dark text
-	buttonTextColor   = color.NRGBA{R: 255, G: 255, B: 255, A: 255} // White for button text
-	disabledTextColor = color.Gray{Y: 123}                          // Disabled text
-)
-
-func (c customTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
-	switch name {
-	case theme.ColorNameBackground:
-		return backgroundColor
-	case theme.ColorNamePrimary:
-		return primaryColor
-	case theme.ColorNameButton:
-		return secondaryColor
-	case theme.ColorNameForeground:
-		return textColor
-	case theme.ColorNameDisabled:
-		return disabledTextColor
-	default:
-		return theme.DefaultTheme().Color(name, variant)
-	}
+// Command interface for undo/redo functionality
+type Command interface {
+	Execute()
+	Undo()
 }
 
-func (c customTheme) Font(style fyne.TextStyle) fyne.Resource {
-	return theme.DefaultTheme().Font(style)
-}
-
-func (c customTheme) Icon(name fyne.ThemeIconName) fyne.Resource {
-	return theme.DefaultTheme().Icon(name)
-}
-
-func (c customTheme) Size(name fyne.ThemeSizeName) float32 {
-	return theme.DefaultTheme().Size(name) * 2 // Increase size of UI elements
-}
-
-func main() {
-	loadReservations()
-	scheduleReservationReset()
-	startAutoRemoveRoutine()
-
-	a := app.NewWithID("com.example.roomreservation")
-	a.Settings().SetTheme(&customTheme{})
-	w := a.NewWindow("Bookie")
-
-	// Define gradient colors
-	topColor := color.NRGBA{R: 245, G: 206, B: 250, A: 255}    // Light pinkish color
-	bottomColor := color.NRGBA{R: 167, G: 117, B: 247, A: 255} // Purple color
-
-	// Create gradient background
-	background := canvas.NewHorizontalGradient(topColor, bottomColor)
-
-	// Increase button sizes
-	buttonStyle := func(btn *widget.Button) {
-		btn.Resize(fyne.NewSize(300, 60))
-	}
-
-	content := container.NewMax()
-	sidebar := container.NewVBox(
-		widget.NewButtonWithIcon("Reservation Views", theme.ContentCopyIcon(), func() {
-			content.Objects = []fyne.CanvasObject{createRoomList(content)}
-			content.Refresh()
-		}),
-		widget.NewButtonWithIcon("Make Reservation", theme.ContentAddIcon(), func() {
-			content.Objects = []fyne.CanvasObject{createReservationForm(content)}
-			content.Refresh()
-		}),
-		widget.NewButtonWithIcon("Is your room available?", theme.SearchIcon(), func() {
-			today := time.Now().Format("2006-01-02")
-			availableRooms := searchAvailableRooms(today, time.Now(), time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day(), 23, 0, 0, 0, time.Local))
-			content.Objects = []fyne.CanvasObject{createAvailableRoomsList(availableRooms)}
-			content.Refresh()
-		}),
-		widget.NewButtonWithIcon("Admin", theme.SettingsIcon(), func() {
-			showAdminTab(content)
-		}),
-	)
-
-	// Apply button styles to all buttons in the sidebar
-	for _, btn := range sidebar.Objects {
-		if button, ok := btn.(*widget.Button); ok {
-			buttonStyle(button)
-		}
-	}
-
-	roomList := createRoomList(content)
-	content.Objects = []fyne.CanvasObject{roomList}
-
-	topBar := widget.NewToolbar()
-
-	// Set the gradient as the background of the main layout
-	mainLayout := container.NewMax(background, container.NewBorder(topBar, nil, sidebar, nil, content))
-
-	w.SetContent(mainLayout)
-	w.Resize(fyne.NewSize(1024, 768)) // Increase the initial window size
-	w.ShowAndRun()
-}
-
+// Define data structures and variables
 type Reservation struct {
+	RoomName  string
 	Date      string
 	StartTime time.Time
 	EndTime   time.Time
@@ -129,12 +47,14 @@ type Reservation struct {
 	Leader    string
 	Student   string
 	Priority  int
+	Active    bool // For soft delete
 }
 
 type Room struct {
 	Name         string
 	Reservations []Reservation
 	mu           sync.Mutex
+	Position     fyne.Position // For floor plan
 }
 
 var rooms = []*Room{
@@ -147,73 +67,33 @@ var rooms = []*Room{
 	{Name: "LRE Room"},
 }
 
-const timeLayout12Hour = "03:04 PM"
+const (
+	timeLayout12Hour   = "3:04 PM"
+	floorPlanImagePath = "floorplan.png" // Path to the uploaded floor plan image
+)
 
 func getPriority(purpose string) int {
-	switch purpose {
-	case "1 = Unbaptized Contact In-person":
-		return 1
-	case "2 = Baptized Persecuted Member In-person":
-		return 2
-	case "3 = Baptized Member In-person":
-		return 3
-	case "4 = Unbaptized Contact Zoom":
-		return 4
-	case "5 = Baptized Member Zoom":
-		return 5
-	case "6 = Group Activities":
-		return 6
-	case "7 = Team Activities":
-		return 7
-	default:
-		return 0
-	}
+	// Implement priority logic if needed
+	return 0 // Placeholder
 }
 
+// Implement methods for Room
 func (r *Room) Reserve(reservation Reservation) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Check for overlapping reservations
+	for _, res := range r.Reservations {
+		if res.Active && res.Date == reservation.Date && (reservation.StartTime.Before(res.EndTime) && reservation.EndTime.After(res.StartTime)) {
+			return fmt.Errorf("time slot already reserved")
+		}
+	}
+
+	reservation.Active = true
 	r.Reservations = append(r.Reservations, reservation)
 	saveReservations()
 
-	holdDuration := 12 * time.Hour
-	reservationTime, err := time.Parse("2006-01-02", reservation.Date)
-	if err == nil && reservationTime.Weekday() == time.Friday {
-		holdDuration = 24 * time.Hour
-	}
-
-	time.AfterFunc(holdDuration, func() {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-
-		for i, res := range r.Reservations {
-			if res == reservation {
-				r.Reservations = append(r.Reservations[:i], r.Reservations[i+1:]...)
-				saveReservations()
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Reservation Hold Expired",
-					Content: fmt.Sprintf("Your reservation hold for %s on %s from %s to %s has expired.", reservation.Purpose, reservation.Date, reservation.StartTime.Format(timeLayout12Hour), reservation.EndTime.Format(timeLayout12Hour)),
-				})
-				break
-			}
-		}
-	})
-
 	return nil
-}
-
-func (r *Room) ListReservations(date string) []Reservation {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	var reservations []Reservation
-	for _, res := range r.Reservations {
-		if res.Date == date {
-			reservations = append(reservations, res)
-		}
-	}
-	return reservations
 }
 
 func (r *Room) DeleteReservation(index int) {
@@ -221,309 +101,697 @@ func (r *Room) DeleteReservation(index int) {
 	defer r.mu.Unlock()
 
 	if index >= 0 && index < len(r.Reservations) {
-		r.Reservations = append(r.Reservations[:index], r.Reservations[index+1:]...)
+		r.Reservations[index].Active = false // Soft delete
 		saveReservations()
 	}
 }
 
-func addRoom(name string) {
-	rooms = append(rooms, &Room{Name: name})
-	saveReservations()
-	fyne.CurrentApp().SendNotification(&fyne.Notification{
-		Title:   "Room Added",
-		Content: fmt.Sprintf("Room '%s' has been successfully added.", name),
-	})
+// User authentication
+type User struct {
+	Username     string
+	PasswordHash []byte
+	Role         string
 }
 
-func removeRoom(name string) {
-	for i, room := range rooms {
-		if room.Name == name {
-			rooms = append(rooms[:i], rooms[i+1:]...)
-			saveReservations()
-			fyne.CurrentApp().SendNotification(&fyne.Notification{
-				Title:   "Room Removed",
-				Content: fmt.Sprintf("Room '%s' has been successfully removed.", name),
-			})
-			return
-		}
-	}
-	fyne.CurrentApp().SendNotification(&fyne.Notification{
-		Title:   "Error",
-		Content: fmt.Sprintf("Room '%s' could not be found.", name),
-	})
-}
+var users []User
+var currentUser *User
 
-func createRoomList(content *fyne.Container) *widget.List {
-	list := widget.NewList(
-		func() int {
-			return len(rooms)
-		},
-		func() fyne.CanvasObject {
-			hbox := container.NewHBox(
-				widget.NewLabel(""),
-				widget.NewLabel(""),
-			)
-			return hbox
-		},
-		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			room := rooms[id]
-			roomLabel := obj.(*fyne.Container).Objects[0].(*widget.Label)
-			roomLabel.SetText(room.Name)
-			statusLabel := obj.(*fyne.Container).Objects[1].(*widget.Label)
-			statusLabel.SetText(fmt.Sprintf("Reservations: %d", len(room.Reservations)))
-		},
-	)
-	list.OnSelected = func(id widget.ListItemID) {
-		selectedRoom := rooms[id].Name
-		content.Objects = []fyne.CanvasObject{createRoomDetailView(selectedRoom)}
-		content.Refresh()
-	}
-	return list
-}
-
-func createRoomAvailability(room *Room) fyne.CanvasObject {
-	grid := container.NewGridWithColumns(1)
-
-	timeSlots := []string{
-		"12:00 AM", "01:00 AM", "02:00 AM", "03:00 AM", "04:00 AM", "05:00 AM", "06:00 AM", "07:00 AM",
-		"08:00 AM", "09:00 AM", "10:00 AM", "11:00 AM", "12:00 PM", "01:00 PM", "02:00 PM", "03:00 PM",
-		"04:00 PM", "05:00 PM", "06:00 PM", "07:00 PM", "08:00 PM", "09:00 PM", "10:00 PM", "11:00 PM",
+func createUser(username, password, role string) error {
+	if len(password) < 8 {
+		return fmt.Errorf("password must be at least 8 characters long")
 	}
 
-	for _, slot := range timeSlots {
-		slotContainer := container.NewHBox(
-			widget.NewLabel(slot),
-			canvas.NewRectangle(color.RGBA{0, 255, 0, 255}),
-		)
-		grid.Add(slotContainer)
-	}
-
-	for _, res := range room.Reservations {
-		startIndex := findTimeSlotIndex(res.StartTime.Format(timeLayout12Hour))
-		endIndex := findTimeSlotIndex(res.EndTime.Format(timeLayout12Hour))
-
-		for i := startIndex; i <= endIndex; i++ {
-			slotRect := canvas.NewRectangle(color.RGBA{255, 0, 0, 255})
-			slotRect.SetMinSize(fyne.NewSize(150, 20))
-			grid.Objects[i] = container.NewHBox(
-				widget.NewLabel(timeSlots[i]),
-				slotRect,
-			)
-			animateRectangle(slotRect)
+	for _, user := range users {
+		if user.Username == username {
+			return fmt.Errorf("username already exists")
 		}
 	}
 
-	return grid
-}
-
-func animateRectangle(rect *canvas.Rectangle) {
-	fromColor := color.RGBA{0, 255, 0, 255}
-	toColor := color.RGBA{255, 0, 0, 255}
-	anim := canvas.NewColorRGBAAnimation(fromColor, toColor, time.Second*2, func(c color.Color) {
-		rect.FillColor = c
-		canvas.Refresh(rect)
-	})
-	anim.AutoReverse = true
-	anim.RepeatCount = fyne.AnimationRepeatForever
-	anim.Start()
-}
-
-func findTimeSlotIndex(timeStr string) int {
-	timeSlots := []string{
-		"12:00 AM", "01:00 AM", "02:00 AM", "03:00 AM", "04:00 AM", "05:00 AM", "06:00 AM", "07:00 AM",
-		"08:00 AM", "09:00 AM", "10:00 AM", "11:00 AM", "12:00 PM", "01:00 PM", "02:00 PM", "03:00 PM",
-		"04:00 PM", "05:00 PM", "06:00 PM", "07:00 PM", "08:00 PM", "09:00 PM", "10:00 PM", "11:00 PM",
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
 	}
+	users = append(users, User{
+		Username:     username,
+		PasswordHash: passwordHash,
+		Role:         role,
+	})
+	saveUsers()
+	return nil
+}
 
-	for i, slot := range timeSlots {
-		if slot == timeStr {
-			return i
+func authenticateUser(username, password string) (*User, error) {
+	for i, user := range users {
+		if user.Username == username {
+			err := bcrypt.CompareHashAndPassword(user.PasswordHash, []byte(password))
+			if err != nil {
+				return nil, fmt.Errorf("incorrect password")
+			}
+			return &users[i], nil
 		}
 	}
-	return -1
+	return nil, fmt.Errorf("user not found")
 }
 
-func searchAvailableRooms(date string, startTime, endTime time.Time) []*Room {
-	var availableRooms []*Room
-	for _, room := range rooms {
-		available := true
-		for _, res := range room.Reservations {
-			if res.Date == date && (startTime.Before(res.EndTime) && endTime.After(res.StartTime)) {
-				available = false
-				break
+func showRegistration(content *fyne.Container, w fyne.Window) {
+	usernameEntry := widget.NewEntry()
+	passwordEntry := widget.NewPasswordEntry()
+	confirmPasswordEntry := widget.NewPasswordEntry()
+
+	form := dialog.NewForm("Register", "Register", "Cancel", []*widget.FormItem{
+		{Text: "Username", Widget: usernameEntry},
+		{Text: "Password", Widget: passwordEntry},
+		{Text: "Confirm Password", Widget: confirmPasswordEntry},
+	}, func(confirmed bool) {
+		if confirmed {
+			if passwordEntry.Text != confirmPasswordEntry.Text {
+				dialog.ShowError(errors.New("passwords do not match"), w)
+				return
+			}
+			err := createUser(usernameEntry.Text, passwordEntry.Text, "User")
+			if err != nil {
+				dialog.ShowError(err, w)
+			} else {
+				dialog.ShowInformation("Success", "User registered successfully", w)
 			}
 		}
-		if available {
-			availableRooms = append(availableRooms, room)
-		}
-	}
-	return availableRooms
+	}, w)
+	form.Show()
 }
 
-func createCalendar(setDate func(string)) fyne.CanvasObject {
-	calendar := container.NewGridWithColumns(7)
-	currentMonth := time.Now().Month()
-	currentYear := time.Now().Year()
+func showLogin(content *fyne.Container, w fyne.Window, onSuccess func(*User)) {
+	usernameEntry := widget.NewEntry()
+	passwordEntry := widget.NewPasswordEntry()
 
-	updateCalendar := func(month time.Month, year int) {
-		calendar.Objects = []fyne.CanvasObject{}
-		firstDay := time.Date(year, month, 1, 0, 0, 0, 0, time.Local)
-		lastDay := firstDay.AddDate(0, 1, -1)
-
-		daysOfWeek := []string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
-		for _, day := range daysOfWeek {
-			calendar.Add(widget.NewLabel(day))
+	form := dialog.NewForm("Login", "Login", "Cancel", []*widget.FormItem{
+		{Text: "Username", Widget: usernameEntry},
+		{Text: "Password", Widget: passwordEntry},
+	}, func(confirmed bool) {
+		if confirmed {
+			user, err := authenticateUser(usernameEntry.Text, passwordEntry.Text)
+			if err != nil {
+				dialog.ShowError(err, w)
+			} else {
+				currentUser = user
+				onSuccess(user)
+			}
 		}
+	}, w)
+	form.Show()
+}
 
-		for i := 0; i < int(firstDay.Weekday()); i++ {
-			calendar.Add(widget.NewLabel(" "))
+// Undo/Redo functionality
+var undoStack []Command
+var redoStack []Command
+
+// ReservationCommand for undo/redo
+type ReservationCommand struct {
+	reservation Reservation
+	room        *Room
+	index       int // Index in the room's reservation slice
+}
+
+func (c *ReservationCommand) Execute() {
+	c.room.Reserve(c.reservation)
+	c.index = len(c.room.Reservations) - 1
+}
+
+func (c *ReservationCommand) Undo() {
+	c.room.DeleteReservation(c.index)
+}
+
+func main() {
+	a := app.NewWithID("com.example.roomreservation")
+	a.Settings().SetTheme(&customtheme.CustomTheme{})
+	w := a.NewWindow("Room Booking")
+
+	// Load reservations and users
+	loadReservations()
+	loadUsers(w) // Pass 'w' here
+
+	// Create initial content
+	content := container.NewMax()
+	content.Objects = []fyne.CanvasObject{widget.NewLabel("Please log in to continue.")}
+
+	// Create sidebar
+	sidebar := createSidebar(content, w)
+
+	// Main layout
+	mainLayout := container.NewBorder(nil, nil, sidebar, nil, content)
+
+	// Implement global keyboard shortcuts
+	w.Canvas().AddShortcut(&desktop.CustomShortcut{
+		KeyName:  fyne.KeyZ,
+		Modifier: fyne.KeyModifierControl,
+	}, func(shortcut fyne.Shortcut) {
+		undo()
+		content.Refresh()
+	})
+
+	w.Canvas().AddShortcut(&desktop.CustomShortcut{
+		KeyName:  fyne.KeyY,
+		Modifier: fyne.KeyModifierControl,
+	}, func(shortcut fyne.Shortcut) {
+		redo()
+		content.Refresh()
+	})
+
+	w.SetContent(mainLayout)
+	w.Resize(fyne.NewSize(1024, 768))
+	w.ShowAndRun()
+}
+
+func createSidebar(content *fyne.Container, w fyne.Window) *fyne.Container {
+	reservationViewsButton := widget.NewButtonWithIcon("Reservation Views", theme.ContentCopyIcon(), func() {
+		interval := 1 * time.Hour // Hourly intervals
+		content.Objects = []fyne.CanvasObject{createGridScheduleView(content, interval, w)}
+		content.Refresh()
+	})
+
+	floorPlanButton := widget.NewButtonWithIcon("Floor Plan View", theme.NavigateNextIcon(), func() {
+		content.Objects = []fyne.CanvasObject{createFloorPlanView(w)}
+		content.Refresh()
+	})
+
+	adminButton := widget.NewButtonWithIcon("Admin Panel", theme.SettingsIcon(), func() {
+		if currentUser != nil && currentUser.Role == "Admin" {
+			showAdminTab(content, w)
+		} else {
+			dialog.ShowInformation("Access Denied", "You do not have permission to access this feature.", w)
 		}
+	})
 
-		for day := 1; day <= lastDay.Day(); day++ {
-			d := day // capture range variable
-			dateButton := widget.NewButton(fmt.Sprintf("%d", day), func() {
-				selectedDate := time.Date(year, month, d, 0, 0, 0, 0, time.Local)
-				setDate(selectedDate.Format("2006-01-02"))
+	buttons := []*widget.Button{reservationViewsButton, floorPlanButton}
+
+	if currentUser != nil {
+		logoutButton := widget.NewButtonWithIcon("Logout", theme.LogoutIcon(), func() {
+			currentUser = nil
+			content.Objects = []fyne.CanvasObject{widget.NewLabel("Please log in to continue.")}
+			content.Refresh()
+		})
+		buttons = append(buttons, logoutButton)
+		if currentUser.Role == "Admin" {
+			buttons = append(buttons, adminButton)
+		}
+	} else {
+		loginButton := widget.NewButtonWithIcon("Login", theme.LoginIcon(), func() {
+			showLogin(content, w, func(user *User) {
+				currentUser = user
+				interval := 1 * time.Hour // Hourly intervals
+				content.Objects = []fyne.CanvasObject{createGridScheduleView(content, interval, w)}
+				content.Refresh()
 			})
-			calendar.Add(dateButton)
+		})
+		registerButton := widget.NewButtonWithIcon("Register", theme.DocumentCreateIcon(), func() {
+			showRegistration(content, w)
+		})
+		buttons = append(buttons, loginButton, registerButton)
+	}
+
+	// Apply styling to sidebar buttons
+	for _, btn := range buttons {
+		btn.Importance = widget.HighImportance
+	}
+
+	sidebar := container.NewVBox()
+	for _, btn := range buttons {
+		sidebar.Add(btn)
+	}
+	return sidebar
+}
+
+func NewTappableImage(img image.Image) *TappableImage {
+	tappableImage := &TappableImage{
+		Image: canvas.NewImageFromImage(img),
+	}
+	tappableImage.Image.FillMode = canvas.ImageFillContain // Set FillMode here
+	tappableImage.ExtendBaseWidget(tappableImage)
+	return tappableImage
+}
+
+// Floor plan view
+func createFloorPlanView(w fyne.Window) fyne.CanvasObject {
+	// Load the floor plan image
+	imgFile, err := os.Open(floorPlanImagePath)
+	if err != nil {
+		return widget.NewLabel("Floor plan not uploaded.")
+	}
+	defer imgFile.Close()
+
+	img, _, err := image.Decode(imgFile)
+	if err != nil {
+		dialog.ShowError(err, w)
+		return widget.NewLabel("Error loading floor plan image.")
+	}
+
+	// Here you call NewTappableImage to create your image with the correct FillMode
+	floorPlanImage := NewTappableImage(img)
+
+	floorPlan := container.NewWithoutLayout(floorPlanImage)
+	// Add room icons to the floor plan
+	for _, room := range rooms {
+		roomCopy := room // Capture variable for closure
+		roomButton := widget.NewButton(room.Name, func() {
+			// Handle room booking from floor plan
+			openRoomBooking(roomCopy, w)
+		})
+		// Position the button
+		roomButton.Move(room.Position)
+		floorPlan.Add(roomButton)
+	}
+
+	// If admin, allow placing rooms on the floor plan
+	if currentUser != nil && currentUser.Role == "Admin" {
+		floorPlanImage.OnTapped = func(event *fyne.PointEvent) {
+			// Show a dialog to select a room to place
+			roomNames := []string{}
+			for _, room := range rooms {
+				roomNames = append(roomNames, room.Name)
+			}
+			roomSelect := widget.NewSelect(roomNames, func(selected string) {
+				// Update the room's position
+				for _, room := range rooms {
+					if room.Name == selected {
+						room.Position = event.Position
+						saveReservations()
+						// Refresh the content
+						content := createFloorPlanView(w)
+						w.SetContent(content)
+						break
+					}
+				}
+			})
+			dialog.ShowCustom("Select Room", "Close", roomSelect, w)
 		}
 	}
 
-	updateCalendar(currentMonth, currentYear)
-
-	prevButton := widget.NewButton("<", func() {
-		if currentMonth == time.January {
-			currentMonth = time.December
-			currentYear--
-		} else {
-			currentMonth--
-		}
-		updateCalendar(currentMonth, currentYear)
-	})
-
-	nextButton := widget.NewButton(">", func() {
-		if currentMonth == time.December {
-			currentMonth = time.January
-			currentYear++
-		} else {
-			currentMonth++
-		}
-		updateCalendar(currentMonth, currentYear)
-	})
-
-	return container.NewVBox(
-		container.NewHBox(prevButton, widget.NewLabel(fmt.Sprintf("%s %d", currentMonth, currentYear)), nextButton),
-		calendar,
-	)
+	scroll := container.NewScroll(floorPlan)
+	return scroll
 }
 
-func createRoomDetailView(roomName string) fyne.CanvasObject {
-	var room *Room
-	for _, r := range rooms {
-		if r.Name == roomName {
-			room = r
+// Define TappableImage
+// Define TappableImage
+type TappableImage struct {
+	widget.BaseWidget
+	Image    *canvas.Image
+	OnTapped func(*fyne.PointEvent)
+}
+
+func (t *TappableImage) Tapped(event *fyne.PointEvent) {
+	if t.OnTapped != nil {
+		t.OnTapped(event)
+	}
+}
+
+func (t *TappableImage) TappedSecondary(event *fyne.PointEvent) {}
+
+// Implement Widget interface
+func (t *TappableImage) CreateRenderer() fyne.WidgetRenderer {
+	return &tappableImageRenderer{
+		image: t.Image,
+	}
+}
+
+type tappableImageRenderer struct {
+	image *canvas.Image
+}
+
+func (r *tappableImageRenderer) Layout(size fyne.Size) {
+	r.image.Resize(size)
+}
+
+func (r *tappableImageRenderer) MinSize() fyne.Size {
+	return r.image.MinSize()
+}
+
+func (r *tappableImageRenderer) Refresh() {
+	r.image.Refresh()
+}
+
+func (r *tappableImageRenderer) BackgroundColor() color.Color {
+	return color.Transparent
+}
+
+func (r *tappableImageRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.image}
+}
+
+func (r *tappableImageRenderer) Destroy() {}
+
+// Implement openRoomBooking function
+func openRoomBooking(room *Room, w fyne.Window) {
+	// Implement room booking from floor plan
+	dialog.ShowInformation("Room Booking", fmt.Sprintf("Booking for room: %s", room.Name), w)
+}
+
+// Implement createGridScheduleView
+func createGridScheduleView(content *fyne.Container, interval time.Duration, w fyne.Window) fyne.CanvasObject {
+	today := time.Now().Format("2006-01-02")
+	timeSlots := generateTimeSlots(interval)
+	grid := container.NewGridWithRows(len(timeSlots) + 1)
+
+	selectedSlots := make(map[string]*ColorButton)
+
+	// Header row with room names
+	header := container.NewGridWithColumns(len(rooms) + 1)
+	header.Add(widget.NewLabel("Time Slots"))
+	for _, room := range rooms {
+		header.Add(widget.NewLabel(room.Name))
+	}
+	grid.Add(header)
+
+	// Generate grid rows for each time slot
+	for _, slot := range timeSlots {
+		slotCopy := slot // capture variable
+		row := container.NewGridWithColumns(len(rooms) + 1)
+		row.Add(widget.NewLabel(slot))
+
+		for _, room := range rooms {
+			roomCopy := room // capture variable
+			reserved := checkRoomReservation(roomCopy, today, slotCopy)
+			button := NewColorButton("", nil)
+			button.Disable()
+
+			if reserved {
+				button.Text = "Booked"
+				button.BackgroundColor = color.NRGBA{R: 220, G: 53, B: 69, A: 255} // Danger color
+				button.Refresh()
+			} else {
+				// Make the button selectable
+				button.Enable()
+				button.Text = "" // Keep the button text empty
+				// Copy variables for closure
+				roomNameCopy := roomCopy.Name
+				slotTimeCopy := slotCopy
+
+				button.OnTapped = func() {
+					handleSlotSelection(selectedSlots, roomNameCopy, slotTimeCopy, button, interval, w)
+				}
+				button.Refresh()
+			}
+			row.Add(button)
+		}
+		grid.Add(row)
+	}
+
+	// Button to confirm selection and open the reservation form
+	confirmButton := widget.NewButton("Book Now", func() {
+		if len(selectedSlots) == 0 {
+			dialog.ShowInformation("Error", "Please select room(s) and time slot(s).", w)
+			return
+		}
+
+		// Group selected slots by room
+		roomSlotsMap := make(map[string][]string)
+		for key := range selectedSlots {
+			roomName, slot := parseSlotKey(key)
+			roomSlotsMap[roomName] = append(roomSlotsMap[roomName], slot)
+		}
+
+		// For simplicity, we'll only allow booking one room at a time
+		if len(roomSlotsMap) > 1 {
+			dialog.ShowInformation("Error", "Please select time slots for only one room at a time.", w)
+			return
+		}
+
+		var roomName string
+		var slots []string
+		for rn, sl := range roomSlotsMap {
+			roomName = rn
+			slots = sl
 			break
 		}
-	}
-	if room == nil {
-		return widget.NewLabel("Room not found")
-	}
 
-	reservationList := container.NewVBox()
-
-	for i, res := range room.Reservations {
-		i := i // capture range variable
-		resText := fmt.Sprintf("%s %s to %s - %s, %s, %s", res.Date, res.StartTime.Format(timeLayout12Hour), res.EndTime.Format(timeLayout12Hour), res.Purpose, res.Leader, res.Student)
-		reservationItem := container.NewHBox(
-			widget.NewLabel(resText),
-			createDeleteButton(room, i, reservationList),
-		)
-		reservationList.Add(reservationItem)
-	}
-
-	availabilityScroll := container.NewVScroll(createRoomAvailability(room))
-	availabilityScroll.SetMinSize(fyne.NewSize(300, 600))
-
-	return container.NewVBox(
-		widget.NewLabel(fmt.Sprintf("Room: %s", room.Name)),
-		widget.NewLabel("Room Availability:"),
-		availabilityScroll,
-		reservationList,
-	)
-}
-
-func createDeleteButton(room *Room, index int, reservationList *fyne.Container) *widget.Button {
-	if room == nil {
-		log.Println("Error: `room` is nil in createDeleteButton")
-		fyne.CurrentApp().SendNotification(&fyne.Notification{
-			Title:   "Error",
-			Content: "Internal error: room is nil",
+		// Sort slots by time
+		sort.Slice(slots, func(i, j int) bool {
+			t1, _ := time.Parse(timeLayout12Hour, slots[i])
+			t2, _ := time.Parse(timeLayout12Hour, slots[j])
+			return t1.Before(t2)
 		})
-		return nil
-	}
 
-	deleteButton := widget.NewButton("Delete", func() {
-		passwordEntry := widget.NewEntry()
-		passwordEntry.SetPlaceHolder("Enter password")
-		passwordEntry.Password = true
-
-		if fyne.CurrentApp() == nil {
-			log.Println("Error: `fyne.CurrentApp()` is nil")
+		// Check if slots are contiguous
+		if !areSlotsContiguous(slots, interval) {
+			dialog.ShowInformation("Error", "Please select contiguous time slots.", w)
 			return
 		}
 
-		if passwordEntry == nil {
-			log.Println("Error: `passwordEntry` is nil")
-			return
-		}
+		// Get start and end times
+		startTimeStr := slots[0]
+		lastSlot := slots[len(slots)-1]
+		endTimeStr := incrementTimeSlot(lastSlot, interval)
 
-		confirmDialog := dialog.NewCustomConfirm("Confirm Action", "Confirm", "Cancel", passwordEntry, func(confirmed bool) {
-			if confirmed && passwordEntry.Text == "changeme" {
-				room.DeleteReservation(index)
-				if reservationList != nil {
-					reservationList.Objects = createReservationList(room)
-					reservationList.Refresh()
-				} else {
-					log.Println("Warning: `reservationList` is nil")
-				}
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Success",
-					Content: "Reservation has been deleted, please let the Teacher know!",
-				})
-			} else if confirmed {
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Error",
-					Content: "Incorrect password.",
-				})
-			}
-		}, fyne.CurrentApp().Driver().AllWindows()[0])
-
-		if confirmDialog != nil {
-			confirmDialog.Show()
-		} else {
-			log.Println("Error: `confirmDialog` is nil")
-		}
+		// Open reservation form with pre-filled data
+		openReservationForm(content, roomName, today, startTimeStr, endTimeStr, interval, w)
 	})
 
-	return deleteButton
+	// Adjust the button's appearance
+	confirmButton.Importance = widget.HighImportance
+
+	scroll := container.NewVScroll(grid)
+	scroll.SetMinSize(fyne.NewSize(800, 600))
+
+	// Wrap the confirm button in an HBox to prevent it from stretching
+	buttonContainer := container.NewHBox(layout.NewSpacer(), confirmButton, layout.NewSpacer())
+
+	// Use container.NewBorder to place the button at the bottom without stretching
+	return container.NewBorder(nil, buttonContainer, nil, nil, scroll)
 }
 
-func createReservationList(room *Room) []fyne.CanvasObject {
-	var reservations []fyne.CanvasObject
+// Handle slot selection logic
+func handleSlotSelection(selectedSlots map[string]*ColorButton, roomNameCopy, slotTimeCopy string, button *ColorButton, interval time.Duration, w fyne.Window) {
+	slotKey := fmt.Sprintf("%s_%s", roomNameCopy, slotTimeCopy)
+	if _, exists := selectedSlots[slotKey]; exists {
+		delete(selectedSlots, slotKey)
+		button.BackgroundColor = customtheme.ButtonColor
+		button.Refresh()
+	} else {
+		// Ensure only one room's slots are selected at a time
+		for key := range selectedSlots {
+			existingRoomName, _ := parseSlotKey(key)
+			if existingRoomName != roomNameCopy {
+				dialog.ShowInformation("Error", "Please select time slots for only one room at a time.", w)
+				return
+			}
+		}
+		selectedSlots[slotKey] = button
+		button.BackgroundColor = color.NRGBA{R: 40, G: 167, B: 69, A: 255} // Success green
+		button.Refresh()
+	}
+}
 
-	for i, res := range room.Reservations {
-		i := i // capture range variable
-		resText := fmt.Sprintf("%s %s to %s - %s, %s, %s", res.Date, res.StartTime.Format(timeLayout12Hour), res.EndTime.Format(timeLayout12Hour), res.Purpose, res.Leader, res.Student)
-		reservationItem := container.NewHBox(
-			widget.NewLabel(resText),
-			createDeleteButton(room, i, nil),
-		)
-		reservations = append(reservations, reservationItem)
+// Implement other necessary functions
+func parseSlotKey(key string) (roomName, timeSlot string) {
+	parts := strings.SplitN(key, "_", 2)
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return "", ""
+}
+
+func incrementTimeSlot(timeSlot string, interval time.Duration) string {
+	t, err := time.Parse(timeLayout12Hour, timeSlot)
+	if err != nil {
+		return timeSlot
+	}
+	t = t.Add(interval)
+	return t.Format(timeLayout12Hour)
+}
+
+func areSlotsContiguous(slots []string, interval time.Duration) bool {
+	if len(slots) <= 1 {
+		return true
+	}
+	for i := 1; i < len(slots); i++ {
+		prevTime, err1 := time.Parse(timeLayout12Hour, slots[i-1])
+		currTime, err2 := time.Parse(timeLayout12Hour, slots[i])
+		if err1 != nil || err2 != nil {
+			return false
+		}
+		if currTime.Sub(prevTime) != interval {
+			return false
+		}
+	}
+	return true
+}
+
+func generateTimeSlots(interval time.Duration) []string {
+	var slots []string
+	start := time.Date(0, 0, 0, 8, 0, 0, 0, time.UTC) // Start at 8 AM
+	end := time.Date(0, 0, 0, 23, 0, 0, 0, time.UTC)  // End at 11 PM
+	for t := start; t.Before(end) || t.Equal(end); t = t.Add(interval) {
+		slots = append(slots, t.Format("3:04 PM"))
+	}
+	return slots
+}
+
+func checkRoomReservation(room *Room, date, timeSlot string) bool {
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	slotTime, err := time.Parse(timeLayout12Hour, timeSlot)
+	if err != nil {
+		return false
+	}
+	for _, res := range room.Reservations {
+		if res.Active && res.Date == date {
+			if slotTime.Equal(res.StartTime) || (slotTime.After(res.StartTime) && slotTime.Before(res.EndTime)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func openReservationForm(content *fyne.Container, roomName, date, startTimeStr, endTimeStr string, interval time.Duration, w fyne.Window) {
+	purposeSelect := widget.NewSelect([]string{
+		"Meeting",
+		"Study Session",
+		"Presentation",
+		"Other",
+	}, func(value string) {})
+	purposeSelect.PlaceHolder = "Select Purpose"
+
+	leaderEntry := widget.NewEntry()
+	leaderEntry.SetPlaceHolder("Your Name")
+	studentEntry := widget.NewEntry()
+	studentEntry.SetPlaceHolder("Additional Info")
+
+	form := &widget.Form{
+		Items: []*widget.FormItem{
+			{Text: "Room:", Widget: widget.NewLabel(roomName)},
+			{Text: "Date:", Widget: widget.NewLabel(date)},
+			{Text: "Start Time:", Widget: widget.NewLabel(startTimeStr)},
+			{Text: "End Time:", Widget: widget.NewLabel(endTimeStr)},
+			{Text: "Purpose:", Widget: purposeSelect},
+			{Text: "Your Name:", Widget: leaderEntry},
+			{Text: "Additional Info:", Widget: studentEntry},
+		},
+		OnSubmit: func() {
+			purpose := purposeSelect.Selected
+			leader := leaderEntry.Text
+			student := studentEntry.Text
+
+			if purpose == "" {
+				dialog.ShowError(errors.New("please select a purpose"), w)
+				return
+			}
+			if leader == "" {
+				dialog.ShowError(errors.New("please enter your name"), w)
+				return
+			}
+
+			var room *Room
+			for _, r := range rooms {
+				if r.Name == roomName {
+					room = r
+					break
+				}
+			}
+			if room == nil {
+				dialog.ShowError(errors.New("room not found"), w)
+				return
+			}
+
+			// Parse date and time
+			startTime, err := time.Parse(timeLayout12Hour, startTimeStr)
+			if err != nil {
+				dialog.ShowError(errors.New("invalid start time format"), w)
+				return
+			}
+
+			endTime, err := time.Parse(timeLayout12Hour, endTimeStr)
+			if err != nil {
+				dialog.ShowError(errors.New("invalid end time format"), w)
+				return
+			}
+
+			// Combine date with time
+			dateOnly, _ := time.Parse("2006-01-02", date)
+			startDateTime := time.Date(dateOnly.Year(), dateOnly.Month(), dateOnly.Day(), startTime.Hour(), startTime.Minute(), 0, 0, time.Local)
+			endDateTime := time.Date(dateOnly.Year(), dateOnly.Month(), dateOnly.Day(), endTime.Hour(), endTime.Minute(), 0, 0, time.Local)
+
+			if startDateTime.After(endDateTime) {
+				dialog.ShowError(errors.New("end time cannot be before start time"), w)
+				return
+			}
+
+			reservation := Reservation{
+				RoomName:  roomName,
+				Date:      date,
+				StartTime: startDateTime,
+				EndTime:   endDateTime,
+				Purpose:   purpose,
+				Leader:    leader,
+				Student:   student,
+				Priority:  getPriority(purpose),
+				Active:    true,
+			}
+
+			// Show booking confirmation
+			showBookingConfirmation(reservation, w, func() {
+				// Proceed with reservation using Command pattern
+				cmd := &ReservationCommand{
+					reservation: reservation,
+					room:        room,
+				}
+				err := cmd.room.Reserve(cmd.reservation)
+				if err != nil {
+					dialog.ShowError(err, w)
+				} else {
+					undoStack = append(undoStack, cmd)
+					// Clear redo stack
+					redoStack = []Command{}
+					dialog.ShowInformation("Success", fmt.Sprintf("Room '%s' has been reserved on %s from %s to %s.", roomName, date, startTimeStr, endTimeStr), w)
+					// Refresh the grid view
+					content.Objects = []fyne.CanvasObject{createGridScheduleView(content, interval, w)}
+					content.Refresh()
+				}
+			})
+		},
 	}
 
-	return reservations
+	dialog.ShowCustom("Make Reservation", "Close", container.NewVBox(form), w)
 }
 
+func showBookingConfirmation(reservation Reservation, w fyne.Window, onConfirm func()) {
+	content := widget.NewLabel(fmt.Sprintf(
+		"Room: %s\nDate: %s\nTime: %s - %s\nPurpose: %s\nName: %s\nInfo: %s",
+		reservation.RoomName,
+		reservation.Date,
+		reservation.StartTime.Format("3:04 PM"),
+		reservation.EndTime.Format("3:04 PM"),
+		reservation.Purpose,
+		reservation.Leader,
+		reservation.Student,
+	))
+	dialog.ShowCustomConfirm("Confirm Booking", "Confirm", "Cancel", content, func(confirmed bool) {
+		if confirmed {
+			onConfirm()
+		}
+	}, w)
+}
+
+// Undo and Redo functions
+func undo() {
+	if len(undoStack) == 0 {
+		return
+	}
+	cmd := undoStack[len(undoStack)-1]
+	undoStack = undoStack[:len(undoStack)-1]
+	cmd.Undo()
+	redoStack = append(redoStack, cmd)
+}
+
+func redo() {
+	if len(redoStack) == 0 {
+		return
+	}
+	cmd := redoStack[len(redoStack)-1]
+	redoStack = redoStack[:len(redoStack)-1]
+	cmd.Execute()
+	undoStack = append(undoStack, cmd)
+}
+
+// Load and save reservations
 func loadReservations() {
 	file, err := os.Open("reservations.json")
 	if os.IsNotExist(err) {
@@ -566,281 +834,272 @@ func saveReservations() {
 	}
 }
 
-func clearReservations() {
-	for _, room := range rooms {
-		room.mu.Lock()
-		room.Reservations = []Reservation{}
-		room.mu.Unlock()
+// Load and save users
+func loadUsers(w fyne.Window) {
+	file, err := os.Open("users.json")
+	if os.IsNotExist(err) {
+		log.Println("users.json file not found, creating a new one.")
+		// Since no user exists, prompt admin creation
+		dialog.ShowInformation("First-time setup", "No admin found. Please create an admin account.", w)
+		showAdminRegistration(nil, w) // Show admin registration form
+		return
+	} else if err != nil {
+		log.Printf("Error opening users file: %v\n", err)
+		return
 	}
-	saveReservations()
-}
+	defer file.Close()
 
-func scheduleReservationReset() {
-	now := time.Now()
-	nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
-	durationUntilMidnight := nextMidnight.Sub(now)
+	decoder := json.NewDecoder(file)
+	err = decoder.Decode(&users)
+	if err != nil {
+		log.Printf("Error decoding users: %v\n", err)
+		return
+	}
 
-	time.AfterFunc(durationUntilMidnight, func() {
-		clearReservations()
-		ticker := time.NewTicker(24 * time.Hour)
-		for range ticker.C {
-			clearReservations()
+	// Check if any admin exists
+	adminExists := false
+	for _, user := range users {
+		if user.Role == "Admin" {
+			adminExists = true
+			break
 		}
-	})
+	}
+
+	if !adminExists {
+		dialog.ShowInformation("No Admin Account", "There are no admin accounts. Please create an admin account.", w)
+		showAdminRegistration(nil, w) // Show admin registration form if no admin exists
+	}
 }
 
-func showAdminTab(content *fyne.Container) {
+func showAdminRegistration(content *fyne.Container, w fyne.Window) {
+	usernameEntry := widget.NewEntry()
 	passwordEntry := widget.NewPasswordEntry()
-	passwordEntry.SetPlaceHolder("Enter admin password")
+	confirmPasswordEntry := widget.NewPasswordEntry()
 
-	dialog.NewForm("Admin Login", "Login", "Cancel", []*widget.FormItem{
+	form := dialog.NewForm("Admin Registration", "Register", "Cancel", []*widget.FormItem{
+		{Text: "Username", Widget: usernameEntry},
 		{Text: "Password", Widget: passwordEntry},
+		{Text: "Confirm Password", Widget: confirmPasswordEntry},
 	}, func(confirmed bool) {
 		if confirmed {
-			if passwordEntry.Text == "Changeme" {
-				content.Objects = []fyne.CanvasObject{createAdminPanel(content)}
-				content.Refresh()
+			if passwordEntry.Text != confirmPasswordEntry.Text {
+				dialog.ShowError(errors.New("passwords do not match"), w)
+				return
+			}
+			err := createUser(usernameEntry.Text, passwordEntry.Text, "Admin")
+			if err != nil {
+				dialog.ShowError(err, w)
 			} else {
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Error",
-					Content: "Incorrect password.",
-				})
+				dialog.ShowInformation("Success", "Admin account created successfully", w)
 			}
 		}
-	}, fyne.CurrentApp().Driver().AllWindows()[0]).Show()
+	}, w)
+	form.Show()
 }
 
-func createAdminPanel(content *fyne.Container) fyne.CanvasObject {
-	return container.NewVBox(
-		widget.NewButton("Clear All Reservations", func() {
-			clearReservations()
-			fyne.CurrentApp().SendNotification(&fyne.Notification{
-				Title:   "Success",
-				Content: "All reservations have been cleared.",
-			})
-		}),
-		widget.NewButton("Add Room", func() {
-			roomNameEntry := widget.NewEntry()
-			passwordEntry := widget.NewPasswordEntry()
-			form := dialog.NewForm("Add Room", "Add", "Cancel", []*widget.FormItem{
-				{Text: "Room Name", Widget: roomNameEntry},
-				{Text: "Password", Widget: passwordEntry},
-			}, func(confirm bool) {
-				if confirm {
-					roomName := roomNameEntry.Text
-					password := passwordEntry.Text
-					if password == "1948" {
-						addRoom(roomName)
-						content.Objects = []fyne.CanvasObject{createRoomList(content)}
-						content.Refresh()
-					} else {
-						fyne.CurrentApp().SendNotification(&fyne.Notification{
-							Title:   "Error",
-							Content: "Incorrect password.",
-						})
-					}
+func saveUsers() {
+	file, err := os.Create("users.json")
+	if err != nil {
+		log.Printf("Error saving users: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	err = encoder.Encode(&users)
+	if err != nil {
+		log.Printf("Error encoding users: %v\n", err)
+	}
+}
+
+// Implement Admin Panel
+func showAdminTab(content *fyne.Container, w fyne.Window) {
+	if currentUser == nil || currentUser.Role != "Admin" {
+		dialog.ShowInformation("Access Denied", "You do not have permission to access this feature.", w)
+		return
+	}
+	content.Objects = []fyne.CanvasObject{createAdminPanel(content, w)}
+	content.Refresh()
+}
+
+func createAdminPanel(content *fyne.Container, w fyne.Window) fyne.CanvasObject {
+	addRoomButton := widget.NewButton("Add Room", func() {
+		roomNameEntry := widget.NewEntry()
+		form := dialog.NewForm("Add Room", "Add", "Cancel", []*widget.FormItem{
+			{Text: "Room Name", Widget: roomNameEntry},
+		}, func(confirm bool) {
+			if confirm {
+				roomName := roomNameEntry.Text
+				if roomName == "" {
+					dialog.ShowError(errors.New("room name cannot be empty"), w)
+					return
 				}
-			}, fyne.CurrentApp().Driver().AllWindows()[0])
-			form.Resize(fyne.NewSize(400, 200))
-			form.Show()
-		}),
-		widget.NewButton("Remove Room", func() {
-			roomNames := make([]string, len(rooms))
-			for i, room := range rooms {
-				roomNames[i] = room.Name
+				addRoom(roomName, w)
+				content.Objects = []fyne.CanvasObject{createAdminPanel(content, w)}
+				content.Refresh()
 			}
-			roomSelect := widget.NewSelect(roomNames, func(value string) {})
-			passwordEntry := widget.NewPasswordEntry()
-			form := dialog.NewForm("Remove Room", "Remove", "Cancel", []*widget.FormItem{
-				{Text: "Room Name", Widget: roomSelect},
-				{Text: "Password", Widget: passwordEntry},
-			}, func(confirm bool) {
-				if confirm {
-					roomName := roomSelect.Selected
-					password := passwordEntry.Text
-					if password == "1948" {
-						removeRoom(roomName)
-						content.Objects = []fyne.CanvasObject{createRoomList(content)}
-						content.Refresh()
-					} else {
-						fyne.CurrentApp().SendNotification(&fyne.Notification{
-							Title:   "Error",
-							Content: "Incorrect password.",
-						})
-					}
-				}
-			}, fyne.CurrentApp().Driver().AllWindows()[0])
-			form.Resize(fyne.NewSize(400, 200))
-			form.Show()
-		}),
+		}, w)
+		form.Resize(fyne.NewSize(400, 200))
+		form.Show()
+	})
+
+	manageUsersButton := widget.NewButton("Manage Users", func() {
+		manageUsers(w)
+	})
+
+	uploadFloorPlanButton := widget.NewButton("Upload Floor Plan", func() {
+		uploadFloorPlan(w)
+	})
+
+	settingsButton := widget.NewButton("Settings", func() {
+		showSettings(w)
+	})
+
+	return container.NewVBox(
+		addRoomButton,
+		manageUsersButton,
+		uploadFloorPlanButton,
+		settingsButton,
 	)
 }
 
-func removePastReservations() {
-	now := time.Now()
-
-	for _, room := range rooms {
-		room.mu.Lock()
-		var updatedReservations []Reservation
-		for _, res := range room.Reservations {
-			if res.EndTime.After(now) {
-				updatedReservations = append(updatedReservations, res)
-			} else {
-				log.Printf("Removing past reservation for room %s: %s %s to %s", room.Name, res.Date, res.StartTime.Format(timeLayout12Hour), res.EndTime.Format(timeLayout12Hour))
-			}
-		}
-		room.Reservations = updatedReservations
-		room.mu.Unlock()
-	}
-
+func addRoom(name string, w fyne.Window) {
+	rooms = append(rooms, &Room{Name: name})
 	saveReservations()
+	dialog.ShowInformation("Room Added", fmt.Sprintf("Room '%s' has been successfully added.", name), w)
 }
 
-func startAutoRemoveRoutine() {
-	ticker := time.NewTicker(1 * time.Minute)
-	go func() {
-		for range ticker.C {
-			removePastReservations()
+func manageUsers(w fyne.Window) {
+	// Implement user management UI
+	dialog.ShowInformation("Manage Users", "User management is not implemented yet.", w)
+}
+
+func uploadFloorPlan(w fyne.Window) {
+	fileDialog := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
+		if err != nil || reader == nil {
+			return
 		}
-	}()
+		defer reader.Close()
+
+		// Save the uploaded image
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+		err = os.WriteFile(floorPlanImagePath, data, 0644)
+		if err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+		dialog.ShowInformation("Success", "Floor plan uploaded successfully.", w)
+	}, w)
+	fileDialog.SetFilter(storage.NewExtensionFileFilter([]string{".png", ".jpg", ".jpeg"}))
+	fileDialog.Show()
 }
 
-func createReservationForm(content *fyne.Container) fyne.CanvasObject {
-	roomNames := make([]string, len(rooms))
-	for i, room := range rooms {
-		roomNames[i] = room.Name
-	}
-	roomSelect := widget.NewSelect(roomNames, func(value string) {})
-	selectedDate := ""
-
-	var calendarButton *widget.Button
-
-	calendarButton = widget.NewButton("Select Date", func() {
-		calendarDialog := dialog.NewCustom("Select Date", "Close", createCalendar(func(date string) {
-			selectedDate = date
-			calendarButton.SetText(date)
-		}), fyne.CurrentApp().Driver().AllWindows()[0])
-		calendarDialog.Resize(fyne.NewSize(300, 300))
-		calendarDialog.Show()
-	})
-
-	timeSlots := []string{
-		"12:00 AM", "01:00 AM", "02:00 AM", "03:00 AM", "04:00 AM", "05:00 AM", "06:00 AM", "07:00 AM",
-		"08:00 AM", "09:00 AM", "10:00 AM", "11:00 AM", "12:00 PM", "01:00 PM", "02:00 PM", "03:00 PM",
-		"04:00 PM", "05:00 PM", "06:00 PM", "07:00 PM", "08:00 PM", "09:00 PM", "10:00 PM", "11:00 PM",
-	}
-	startTimeSelect := widget.NewSelect(timeSlots, func(value string) {})
-	endTimeSelect := widget.NewSelect(timeSlots, func(value string) {})
-	purposeSelect := widget.NewSelect([]string{
-		"1 = Unbaptized Contact In-person",
-		"2 = Baptized Persecuted Member In-person",
-		"3 = Baptized Member In-person",
-		"4 = Unbaptized Contact Zoom",
-		"5 = Baptized Member Zoom",
-		"6 = Group Activities",
-		"7 = Team Activities",
-	}, func(value string) {})
-	leaderEntry := widget.NewEntry()
-	leaderEntry.SetPlaceHolder("Teacher Name")
-	studentEntry := widget.NewEntry()
-	studentEntry.SetPlaceHolder("Student Name")
-
-	form := &widget.Form{
-		Items: []*widget.FormItem{
-			{Text: "Select Room:", Widget: roomSelect},
-			{Text: "Select Date:", Widget: calendarButton},
-			{Text: "Select Start Time:", Widget: startTimeSelect},
-			{Text: "Select End Time:", Widget: endTimeSelect},
-			{Text: "Meeting Type:", Widget: purposeSelect},
-			{Text: "Teacher Name:", Widget: leaderEntry},
-			{Text: "Contact/Member Name:", Widget: studentEntry},
-		},
-		OnSubmit: func() {
-			roomName := roomSelect.Selected
-			date := selectedDate
-			startTimeStr := startTimeSelect.Selected
-			endTimeStr := endTimeSelect.Selected
-			purpose := purposeSelect.Selected
-			leader := leaderEntry.Text
-			student := studentEntry.Text
-
-			var room *Room
-			for _, r := range rooms {
-				if r.Name == roomName {
-					room = r
-					break
-				}
-			}
-			if room == nil {
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Error",
-					Content: "Room not found",
-				})
-				return
-			}
-
-			startTime, err := time.Parse(timeLayout12Hour, startTimeStr)
-			if err != nil {
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Error",
-					Content: "Invalid start time format",
-				})
-				return
-			}
-
-			endTime, err := time.Parse(timeLayout12Hour, endTimeStr)
-			if err != nil {
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Error",
-					Content: "Invalid end time format",
-				})
-				return
-			}
-
-			reservation := Reservation{
-				Date:      date,
-				StartTime: startTime,
-				EndTime:   endTime,
-				Purpose:   purpose,
-				Leader:    leader,
-				Student:   student,
-				Priority:  getPriority(purpose),
-			}
-
-			if startTime.After(endTime) {
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Error",
-					Content: "End time cannot be before start time",
-				})
-				return
-			}
-
-			err = room.Reserve(reservation)
-			if err != nil {
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Error",
-					Content: err.Error(),
-				})
-			} else {
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Success",
-					Content: fmt.Sprintf("Room '%s' has been reserved on %s from %s to %s.", roomName, date, startTimeStr, endTimeStr),
-				})
-			}
-		},
-	}
-	return container.NewVBox(form)
+func showSettings(w fyne.Window) {
+	// Implement settings UI
+	dialog.ShowInformation("Settings", "Settings are not implemented yet.", w)
 }
 
-func createAvailableRoomsList(rooms []*Room) fyne.CanvasObject {
-	list := container.NewVBox()
-	for _, room := range rooms {
-		roomName := room.Name
-		button := widget.NewButton(roomName, func() {
-			details := createRoomDetailView(roomName)
-			dialog.ShowCustom(roomName, "Close", details, fyne.CurrentApp().Driver().AllWindows()[0])
-		})
-		list.Add(button)
+// Custom ColorButton with enhancements
+type ColorButton struct {
+	widget.BaseWidget
+	Text            string
+	OnTapped        func()
+	BackgroundColor color.Color
+	Disabled        bool
+}
+
+func NewColorButton(text string, tapped func()) *ColorButton {
+	btn := &ColorButton{
+		Text:            text,
+		OnTapped:        tapped,
+		BackgroundColor: customtheme.ButtonColor, // Use custom theme color
 	}
-	return list
+	btn.ExtendBaseWidget(btn)
+	return btn
+}
+
+func (b *ColorButton) CreateRenderer() fyne.WidgetRenderer {
+	label := canvas.NewText(b.Text, customtheme.TextColor) // Use custom text color
+	label.Alignment = fyne.TextAlignCenter
+
+	background := canvas.NewRectangle(b.BackgroundColor)
+
+	objects := []fyne.CanvasObject{background, label}
+
+	return &colorButtonRenderer{
+		button:     b,
+		label:      label,
+		background: background,
+		objects:    objects,
+	}
+}
+
+type colorButtonRenderer struct {
+	button     *ColorButton
+	label      *canvas.Text
+	background *canvas.Rectangle
+	objects    []fyne.CanvasObject
+}
+
+func (r *colorButtonRenderer) Layout(size fyne.Size) {
+	r.background.Resize(size)
+	r.label.Move(fyne.NewPos(customtheme.Padding, customtheme.Padding))
+	r.label.Resize(size.Subtract(fyne.NewSize(customtheme.Padding*2, customtheme.Padding*2)))
+}
+
+func (r *colorButtonRenderer) MinSize() fyne.Size {
+	labelSize := r.label.MinSize()
+	padding := customtheme.Padding
+	return fyne.NewSize(labelSize.Width+padding*2, labelSize.Height+padding*2)
+}
+
+func (r *colorButtonRenderer) Refresh() {
+	r.label.Text = r.button.Text
+	if r.button.Disabled {
+		r.label.Color = customtheme.DisabledTextColor
+	} else {
+		r.label.Color = customtheme.TextColor
+	}
+	r.label.Refresh()
+	r.background.FillColor = r.button.BackgroundColor
+	r.background.Refresh()
+}
+
+func (r *colorButtonRenderer) BackgroundColor() color.Color {
+	return color.Transparent
+}
+
+func (r *colorButtonRenderer) Objects() []fyne.CanvasObject {
+	return r.objects
+}
+
+func (r *colorButtonRenderer) Destroy() {}
+
+func (b *ColorButton) Tapped(_ *fyne.PointEvent) {
+	if b.Disabled {
+		return
+	}
+	if b.OnTapped != nil {
+		b.OnTapped()
+	}
+}
+
+func (b *ColorButton) TappedSecondary(_ *fyne.PointEvent) {}
+
+func (b *ColorButton) Disable() {
+	b.Disabled = true
+	b.Refresh()
+}
+
+func (b *ColorButton) Enable() {
+	b.Disabled = false
+	b.Refresh()
+}
+
+func (b *ColorButton) IsDisabled() bool {
+	return b.Disabled
 }
